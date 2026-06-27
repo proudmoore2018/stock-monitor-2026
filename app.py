@@ -44,19 +44,20 @@ def save_notes(notes_dict):
 
 if 'notes' not in st.session_state: st.session_state.notes = load_notes()
 
-# ================= 4. 数据获取引擎 =================
+# ================= 4. 数据获取引擎 (增加超时控制防卡死) =================
 def _format_tencent_code(code):
     if code.startswith(('6', '688', '000', '399')): return f"sh{code}" if code.startswith(('6', '000')) else f"sz{code}"
     elif code.startswith(('0', '3')): return f"sz{code}"
     return f"bj{code}" 
 
-@st.cache_data(ttl=3) 
+@st.cache_data(ttl=5) # 云端网络波动，稍微放宽缓存
 def get_tencent_realtime(codes_list):
     if not codes_list: return pd.DataFrame()
     tencent_codes = [_format_tencent_code(c) for c in codes_list]
     url = f"http://qt.gtimg.cn/q={','.join(tencent_codes)}"
     try:
-        response = requests.get(url, timeout=2)
+        # 增加 timeout=3，防止海外服务器请求国内接口卡死
+        response = requests.get(url, timeout=3) 
         response.encoding = 'gbk'
         data_list = []
         for line in response.text.strip().split('\n'):
@@ -75,30 +76,32 @@ def get_tencent_realtime(codes_list):
         return pd.DataFrame(data_list)
     except: return pd.DataFrame()
 
-@st.cache_data(ttl=60) # 资金流向1分钟缓存
+@st.cache_data(ttl=120) # 资金流向2分钟缓存
 def get_fund_flow_rank():
-    """获取全市场主力资金流向排名 (单次请求，速度极快)"""
     try:
         df = ak.stock_individual_fund_flow_rank(indicator="今日")
         return df[['代码', '今日主力净流入-净额']].copy()
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
-# ================= 5. 颜色格式化函数 (新增) =================
+# ================= 5. 颜色与买点评估函数 =================
 def format_change(val):
-    """格式化涨跌幅：红涨绿跌"""
     if pd.isna(val): return "⚪ -"
     if val > 0: return f"🔴 +{val:.2f}%"
     elif val < 0: return f"🟢 {val:.2f}%"
     else: return f"⚪ {val:.2f}%"
 
 def format_fund(val):
-    """格式化主力资金：红流入绿流出 (单位转为万元)"""
     if pd.isna(val): return "⚪ -"
     val_wan = val / 10000 
     if val_wan > 0: return f"🔴 +{val_wan:.0f}万"
     elif val_wan < 0: return f"🟢 {val_wan:.0f}万"
     else: return f"⚪ {val_wan:.0f}万"
+
+def evaluate_buy_signal(short_sig, mid_sig, fund_val, premium):
+    if short_sig == "🚀 短线出击" and pd.notna(fund_val) and fund_val > 0: return "🎯 右侧追击"
+    if mid_sig in ["🛡️ 中线多头", "🔄 中线筑底"] and pd.notna(premium) and premium < 5.0: return "🛡️ 左侧潜伏"
+    if short_sig == "👀 缩量企稳" and mid_sig in ["🛡️ 中线多头", "🔄 中线筑底"]: return "👀 缩量企稳"
+    return "⏸️ 暂无买点"
 
 # ================= 6. 量化指标计算引擎 =================
 def calculate_signals(df):
@@ -153,25 +156,19 @@ selected_sector = st.sidebar.radio("选择关注的板块", list(STOCK_POOL.keys
 target_codes = STOCK_POOL[selected_sector]
 
 st.sidebar.markdown("---")
-with st.sidebar.expander("📊 量化指标设计说明", expanded=False):
+with st.sidebar.expander("📊 量化与买点设计说明", expanded=False):
     st.markdown("""
-    **⚡ 短线雷达 (侧重爆发与情绪)**
-    - 🚀 **短线出击**: 价格>5日线>10日线，且量比>1.5 (放量多头)。
-    - ⚠️ **短线超买**: RSI(14) > 75，随时可能回调。
+    **🎯 买点雷达 (在下方体检区查看)**
+    - **🎯 右侧追击**：短线出击 + 主力净流入。
+    - **🛡️ 左侧潜伏**：中线向好 + 接近合理入手价。
     
-    **🛡️ 中线滤网 (侧重趋势与安全)**
-    - 🛡️ **中线多头**: 价格>20日>60日线，且MACD零轴上方金叉。
-    - 🔄 **中线筑底**: 突破20日线，MACD水下金叉(左侧潜伏)。
-    
-    **🔴🟢 视觉标识**
-    - 涨跌幅与主力资金采用国际通用金融标识：🔴代表涨/流入，🟢代表跌/流出。
+    **☁️ 云端使用提示**
+    - 首次打开若较慢，是因为海外服务器正在“唤醒”及请求国内数据。
+    - 为保证秒开，短中线指标已优化为**选中个股后按需加载**。
     """)
-
-st.sidebar.markdown("---")
-st.sidebar.info("💡 **操作提示**：\n双击表格单元格编辑笔记。\n使用下拉框切换K线。")
 st.sidebar.caption(f"📁 笔记路径: `{NOTES_FILE}`")
 
-# ================= 8. 核心看板 =================
+# ================= 8. 核心看板 (极速版) =================
 st.title("💻 国内科技股核心公司")
 
 # 8.1 大盘指数
@@ -190,30 +187,19 @@ for i, code in enumerate(index_codes):
 
 st.markdown("---")
 
-# 8.2 可编辑表格区
-st.subheader("📋 核心个股量化监控")
-pause_refresh = st.checkbox("⏸️ 暂停行情刷新 (连续编辑笔记时勾选)", value=False)
+# 8.2 主监控表格 (去除了耗时的全量K线计算，保证秒开)
+st.subheader("📋 核心个股实时监控")
+pause_refresh = st.checkbox("⏸️ 暂停行情刷新", value=False)
 
 sector_data = get_tencent_realtime(target_codes)
 fund_flow = get_fund_flow_rank()
 
 if not sector_data.empty:
-    # 合并主力资金数据
     if not fund_flow.empty:
         sector_data = sector_data.merge(fund_flow, on='代码', how='left')
     else:
         sector_data['今日主力净流入-净额'] = np.nan
 
-    with st.spinner("⏳ 正在计算短/中线量化指标..."):
-        short_signals, mid_signals = [], []
-        for code in sector_data['代码']:
-            indicators = get_kline_indicators(code)
-            short_signals.append(indicators["short"])
-            mid_signals.append(indicators["mid"])
-        sector_data['短线雷达'] = short_signals
-        sector_data['中线滤网'] = mid_signals
-
-    # 先按数字涨跌幅排序
     sector_data = sector_data.sort_values(by='涨跌幅', ascending=False).reset_index(drop=True)
     sector_data['成交额(万)'] = (sector_data['成交额'] / 10000).round(0)
     
@@ -227,11 +213,11 @@ if not sector_data.empty:
         return None
     sector_data['溢价率(%)'] = sector_data.apply(calc_premium, axis=1)
 
-    # 生成带颜色的显示列 (新增)
+    # 生成带颜色的显示列
     sector_data['涨跌幅_display'] = sector_data['涨跌幅'].apply(format_change)
     sector_data['主力资金_display'] = sector_data['今日主力净流入-净额'].apply(format_fund)
 
-    display_cols = ['代码', '名称', '最新价', '涨跌幅_display', '主力资金_display', '短线雷达', '中线滤网', '核心优势', '合理入手价', '溢价率(%)', '换手率']
+    display_cols = ['代码', '名称', '最新价', '涨跌幅_display', '主力资金_display', '核心优势', '合理入手价', '溢价率(%)', '换手率']
     editor_df = sector_data[display_cols].copy()
 
     edited_df = st.data_editor(
@@ -241,11 +227,9 @@ if not sector_data.empty:
             "名称": st.column_config.TextColumn(disabled=True, width="medium"),
             "最新价": st.column_config.NumberColumn(disabled=True, format="%.2f", width="small"),
             "涨跌幅_display": st.column_config.TextColumn("涨跌幅", disabled=True, width="small"),
-            "主力资金_display": st.column_config.TextColumn("主力资金", disabled=True, width="medium", help="今日主力大单净流入/流出金额"),
-            "短线雷达": st.column_config.TextColumn(disabled=True, width="medium"),
-            "中线滤网": st.column_config.TextColumn(disabled=True, width="medium"),
+            "主力资金_display": st.column_config.TextColumn("主力资金", disabled=True, width="medium"),
             "核心优势": st.column_config.TextColumn("核心优势 (双击编辑)", width="large"),
-            "合理入手价": st.column_config.NumberColumn("合理入手价（±10%）(双击编辑)", format="%.2f", width="medium"),
+            "合理入手价": st.column_config.NumberColumn("合理入手价(±10%)", format="%.2f", width="medium"),
             "溢价率(%)": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
             "换手率": st.column_config.NumberColumn(disabled=True, format="%.2f", width="small"),
         },
@@ -274,16 +258,16 @@ if not sector_data.empty:
             save_notes(st.session_state.notes)
             st.toast("✅ 笔记已保存！", icon="💾")
 else:
-    st.warning("未获取到实时数据。")
+    st.warning("未获取到实时数据，请检查网络。")
 
-# ================= 9. K线与深度体检区 =================
+# ================= 9. 深度体检区 (按需加载，指哪打哪) =================
 st.markdown("---")
 if not sector_data.empty:
     name_map = dict(zip(sector_data['代码'], sector_data['名称']))
     col_sel, col_btn = st.columns([3, 1])
     with col_sel:
         selected_stock_code = st.selectbox(
-            "选择一只股票查看深度体检报告", 
+            "🔍 选择个股进行深度量化体检 (加载需1-2秒)", 
             sector_data['代码'].tolist(), 
             format_func=lambda x: f"{name_map.get(x, '未知')} ({x})"
         )
@@ -294,33 +278,42 @@ if not sector_data.empty:
         stock_name = name_map.get(selected_stock_code, '未知')
         stock_adv = st.session_state.notes.get(selected_stock_code, {}).get('adv', DEFAULT_ADV)
         target_p = st.session_state.notes.get(selected_stock_code, {}).get('target_price', 0.0)
+        premium_val = sector_data[sector_data['代码'] == selected_stock_code]['溢价率(%)'].iloc[0]
+        fund_val = sector_data[sector_data['代码'] == selected_stock_code]['今日主力净流入-净额'].iloc[0]
         
-        indicators = get_kline_indicators(selected_stock_code)
-        kline_data = indicators["df"]
-        
-        # 获取单只股票的详细资金和估值 (复用之前的逻辑)
-        with st.spinner("🔍 正在获取基本面与资金数据..."):
-            res = {"pe": "-", "pb": "-", "main_net": "-"}
+        with st.spinner(f"⏳ 正在拉取 {stock_name} 的历史K线与量化指标..."):
+            indicators = get_kline_indicators(selected_stock_code)
+            kline_data = indicators["df"]
+            short_sig = indicators["short"]
+            mid_sig = indicators["mid"]
+            
+            # 计算该股的买点
+            buy_sig = evaluate_buy_signal(short_sig, mid_sig, fund_val, premium_val)
+
+            # 获取估值
+            res = {"pe": "-", "pb": "-"}
             try:
                 ind_df = ak.stock_a_indicator_lg(symbol=selected_stock_code)
                 if not ind_df.empty:
                     res["pe"] = f"{ind_df['pe_ttm'].iloc[-1]:.1f}"
                     res["pb"] = f"{ind_df['pb'].iloc[-1]:.2f}"
             except: pass
-            try:
-                market = "sh" if selected_stock_code.startswith(('6','9')) else "sz"
-                fund_df = ak.stock_individual_fund_flow(stock=selected_stock_code, market=market)
-                if not fund_df.empty:
-                    main_net = fund_df['主力净流入-净额'].iloc[-1]
-                    res["main_net"] = format_fund(main_net) # 复用红绿格式化函数
-            except: pass
 
         st.subheader(f"🩺 {stock_name} 深度体检报告")
         metric_cols = st.columns(4)
-        metric_cols[0].metric("市盈率 (PE-TTM)", res["pe"])
+        metric_cols[0].metric("市盈率 (PE)", res["pe"])
         metric_cols[1].metric("市净率 (PB)", res["pb"])
-        metric_cols[2].metric("今日主力净流入", res["main_net"])
-        metric_cols[3].metric("当前短线/中线", f"{indicators['short']} | {indicators['mid']}")
+        metric_cols[2].metric("今日主力资金", format_fund(fund_val))
+        
+        # 买点信号高亮显示
+        if "右侧" in buy_sig:
+            metric_cols[3].metric("🎯 买点评估", buy_sig, delta="适合追涨", delta_color="normal")
+        elif "左侧" in buy_sig or "企稳" in buy_sig:
+            metric_cols[3].metric("🎯 买点评估", buy_sig, delta="适合低吸", delta_color="normal")
+        else:
+            metric_cols[3].metric("🎯 买点评估", buy_sig, delta="建议观望", delta_color="off")
+        
+        st.caption(f"**量化诊断**：短线雷达 [{short_sig}] | 中线滤网 [{mid_sig}] | 溢价率 [{premium_val}%]")
 
         if not kline_data.empty:
             fig = go.Figure(data=[go.Candlestick(
