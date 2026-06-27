@@ -44,19 +44,19 @@ def save_notes(notes_dict):
 
 if 'notes' not in st.session_state: st.session_state.notes = load_notes()
 
-# ================= 4. 数据获取引擎 (增加超时控制防卡死) =================
+# ================= 4. 数据获取引擎 (海外防卡死版) =================
 def _format_tencent_code(code):
     if code.startswith(('6', '688', '000', '399')): return f"sh{code}" if code.startswith(('6', '000')) else f"sz{code}"
     elif code.startswith(('0', '3')): return f"sz{code}"
     return f"bj{code}" 
 
-@st.cache_data(ttl=5) # 云端网络波动，稍微放宽缓存
+@st.cache_data(ttl=10) # 海外网络波动，缓存设为10秒
 def get_tencent_realtime(codes_list):
     if not codes_list: return pd.DataFrame()
     tencent_codes = [_format_tencent_code(c) for c in codes_list]
     url = f"http://qt.gtimg.cn/q={','.join(tencent_codes)}"
     try:
-        # 增加 timeout=3，防止海外服务器请求国内接口卡死
+        # 强制 3 秒超时，防止海外服务器请求国内接口无限卡死
         response = requests.get(url, timeout=3) 
         response.encoding = 'gbk'
         data_list = []
@@ -74,14 +74,13 @@ def get_tencent_realtime(codes_list):
                     })
                 except: continue
         return pd.DataFrame(data_list)
-    except: return pd.DataFrame()
+    except requests.exceptions.Timeout:
+        st.warning("⚠️ 腾讯行情接口请求超时 (海外网络波动)，请稍后刷新页面。")
+        return pd.DataFrame()
+    except Exception: 
+        return pd.DataFrame()
 
-@st.cache_data(ttl=120) # 资金流向2分钟缓存
-def get_fund_flow_rank():
-    try:
-        df = ak.stock_individual_fund_flow_rank(indicator="今日")
-        return df[['代码', '今日主力净流入-净额']].copy()
-    except: return pd.DataFrame()
+# ⚠️ 注意：这里彻底删除了 get_fund_flow_rank (全市场资金流向)，它是导致海外卡死的元凶！
 
 # ================= 5. 颜色与买点评估函数 =================
 def format_change(val):
@@ -138,6 +137,7 @@ def calculate_signals(df):
 @st.cache_data(ttl=3600) 
 def get_kline_indicators(symbol):
     try:
+        # 增加超时控制
         df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
         short_sig, mid_sig = calculate_signals(df)
         return {"short": short_sig, "mid": mid_sig, "df": df.tail(60)}
@@ -156,19 +156,16 @@ selected_sector = st.sidebar.radio("选择关注的板块", list(STOCK_POOL.keys
 target_codes = STOCK_POOL[selected_sector]
 
 st.sidebar.markdown("---")
-with st.sidebar.expander("📊 量化与买点设计说明", expanded=False):
+with st.sidebar.expander("☁️ 云端使用说明", expanded=False):
     st.markdown("""
-    **🎯 买点雷达 (在下方体检区查看)**
-    - **🎯 右侧追击**：短线出击 + 主力净流入。
-    - **🛡️ 左侧潜伏**：中线向好 + 接近合理入手价。
-    
-    **☁️ 云端使用提示**
-    - 首次打开若较慢，是因为海外服务器正在“唤醒”及请求国内数据。
-    - 为保证秒开，短中线指标已优化为**选中个股后按需加载**。
+    **⚠️ 为什么主表格没有“主力资金”了？**
+    - 获取全市场 5000 只股票的资金数据，会导致海外服务器**严重超时卡死**。
+    - 为了保证网页秒开，主表格已精简。
+    - **主力资金、短中线雷达、买点评估**，已移至下方的 **“深度体检区”**，选中个股后按需加载。
     """)
 st.sidebar.caption(f"📁 笔记路径: `{NOTES_FILE}`")
 
-# ================= 8. 核心看板 (极速版) =================
+# ================= 8. 核心看板 (海外极速版) =================
 st.title("💻 国内科技股核心公司")
 
 # 8.1 大盘指数
@@ -187,19 +184,13 @@ for i, code in enumerate(index_codes):
 
 st.markdown("---")
 
-# 8.2 主监控表格 (去除了耗时的全量K线计算，保证秒开)
+# 8.2 主监控表格 (极致精简，保证秒开)
 st.subheader("📋 核心个股实时监控")
 pause_refresh = st.checkbox("⏸️ 暂停行情刷新", value=False)
 
 sector_data = get_tencent_realtime(target_codes)
-fund_flow = get_fund_flow_rank()
 
 if not sector_data.empty:
-    if not fund_flow.empty:
-        sector_data = sector_data.merge(fund_flow, on='代码', how='left')
-    else:
-        sector_data['今日主力净流入-净额'] = np.nan
-
     sector_data = sector_data.sort_values(by='涨跌幅', ascending=False).reset_index(drop=True)
     sector_data['成交额(万)'] = (sector_data['成交额'] / 10000).round(0)
     
@@ -215,9 +206,9 @@ if not sector_data.empty:
 
     # 生成带颜色的显示列
     sector_data['涨跌幅_display'] = sector_data['涨跌幅'].apply(format_change)
-    sector_data['主力资金_display'] = sector_data['今日主力净流入-净额'].apply(format_fund)
 
-    display_cols = ['代码', '名称', '最新价', '涨跌幅_display', '主力资金_display', '核心优势', '合理入手价', '溢价率(%)', '换手率']
+    # ⚠️ 移除了主力资金列，防止海外卡死
+    display_cols = ['代码', '名称', '最新价', '涨跌幅_display', '核心优势', '合理入手价', '溢价率(%)', '换手率', '成交额(万)']
     editor_df = sector_data[display_cols].copy()
 
     edited_df = st.data_editor(
@@ -227,11 +218,11 @@ if not sector_data.empty:
             "名称": st.column_config.TextColumn(disabled=True, width="medium"),
             "最新价": st.column_config.NumberColumn(disabled=True, format="%.2f", width="small"),
             "涨跌幅_display": st.column_config.TextColumn("涨跌幅", disabled=True, width="small"),
-            "主力资金_display": st.column_config.TextColumn("主力资金", disabled=True, width="medium"),
             "核心优势": st.column_config.TextColumn("核心优势 (双击编辑)", width="large"),
             "合理入手价": st.column_config.NumberColumn("合理入手价(±10%)", format="%.2f", width="medium"),
             "溢价率(%)": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
             "换手率": st.column_config.NumberColumn(disabled=True, format="%.2f", width="small"),
+            "成交额(万)": st.column_config.NumberColumn(disabled=True, format="%.0f", width="medium"),
         },
         hide_index=True, use_container_width=True, height=450,
         key=f"stock_editor_{selected_sector}", disabled=pause_refresh 
@@ -258,16 +249,16 @@ if not sector_data.empty:
             save_notes(st.session_state.notes)
             st.toast("✅ 笔记已保存！", icon="💾")
 else:
-    st.warning("未获取到实时数据，请检查网络。")
+    st.warning("⚠️ 未获取到实时数据，可能是海外服务器网络波动，请尝试刷新页面 (按 F5)。")
 
-# ================= 9. 深度体检区 (按需加载，指哪打哪) =================
+# ================= 9. 深度体检区 (按需加载单只股票数据) =================
 st.markdown("---")
 if not sector_data.empty:
     name_map = dict(zip(sector_data['代码'], sector_data['名称']))
     col_sel, col_btn = st.columns([3, 1])
     with col_sel:
         selected_stock_code = st.selectbox(
-            "🔍 选择个股进行深度量化体检 (加载需1-2秒)", 
+            "🔍 选择个股进行深度量化体检 (含主力资金与买卖点)", 
             sector_data['代码'].tolist(), 
             format_func=lambda x: f"{name_map.get(x, '未知')} ({x})"
         )
@@ -279,19 +270,25 @@ if not sector_data.empty:
         stock_adv = st.session_state.notes.get(selected_stock_code, {}).get('adv', DEFAULT_ADV)
         target_p = st.session_state.notes.get(selected_stock_code, {}).get('target_price', 0.0)
         premium_val = sector_data[sector_data['代码'] == selected_stock_code]['溢价率(%)'].iloc[0]
-        fund_val = sector_data[sector_data['代码'] == selected_stock_code]['今日主力净流入-净额'].iloc[0]
         
-        with st.spinner(f"⏳ 正在拉取 {stock_name} 的历史K线与量化指标..."):
+        with st.spinner(f"⏳ 正在拉取 {stock_name} 的 K线、资金与量化指标..."):
+            # 1. 获取 K 线与短中线信号
             indicators = get_kline_indicators(selected_stock_code)
             kline_data = indicators["df"]
             short_sig = indicators["short"]
             mid_sig = indicators["mid"]
             
-            # 计算该股的买点
-            buy_sig = evaluate_buy_signal(short_sig, mid_sig, fund_val, premium_val)
-
-            # 获取估值
-            res = {"pe": "-", "pb": "-"}
+            # 2. 获取单只股票的资金与估值 (单只请求在海外通常能成功)
+            fund_val = np.nan
+            res = {"pe": "-", "pb": "-", "main_net": "-"}
+            try:
+                market = "sh" if selected_stock_code.startswith(('6','9')) else "sz"
+                fund_df = ak.stock_individual_fund_flow(stock=selected_stock_code, market=market)
+                if not fund_df.empty:
+                    fund_val = fund_df['主力净流入-净额'].iloc[-1]
+                    res["main_net"] = format_fund(fund_val)
+            except: pass
+            
             try:
                 ind_df = ak.stock_a_indicator_lg(symbol=selected_stock_code)
                 if not ind_df.empty:
@@ -299,13 +296,16 @@ if not sector_data.empty:
                     res["pb"] = f"{ind_df['pb'].iloc[-1]:.2f}"
             except: pass
 
+            # 3. 计算买点
+            buy_sig = evaluate_buy_signal(short_sig, mid_sig, fund_val, premium_val)
+
         st.subheader(f"🩺 {stock_name} 深度体检报告")
         metric_cols = st.columns(4)
         metric_cols[0].metric("市盈率 (PE)", res["pe"])
         metric_cols[1].metric("市净率 (PB)", res["pb"])
-        metric_cols[2].metric("今日主力资金", format_fund(fund_val))
+        metric_cols[2].metric("今日主力资金", res["main_net"])
         
-        # 买点信号高亮显示
+        # 买点信号高亮
         if "右侧" in buy_sig:
             metric_cols[3].metric("🎯 买点评估", buy_sig, delta="适合追涨", delta_color="normal")
         elif "左侧" in buy_sig or "企稳" in buy_sig:
@@ -313,7 +313,7 @@ if not sector_data.empty:
         else:
             metric_cols[3].metric("🎯 买点评估", buy_sig, delta="建议观望", delta_color="off")
         
-        st.caption(f"**量化诊断**：短线雷达 [{short_sig}] | 中线滤网 [{mid_sig}] | 溢价率 [{premium_val}%]")
+        st.caption(f"**量化诊断**：短线 [{short_sig}] | 中线 [{mid_sig}] | 溢价率 [{premium_val}%]")
 
         if not kline_data.empty:
             fig = go.Figure(data=[go.Candlestick(
